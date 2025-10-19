@@ -243,7 +243,23 @@ You should see folders like:
    sudo gem install cocoapods
    ```
 
-### 2.4 Set Up Cloud Development
+### 2.4 Set Up Cloud Development (Optional)
+
+<Note>
+**For Cloud Development**: If you plan to work on the MentraOS Cloud backend or need to run the full cloud stack locally, see the comprehensive [Local Development Setup](https://docs.mentraos.com/development/local-setup) guide in the Cloud documentation.
+
+The cloud setup includes:
+- Detailed environment configuration
+- Docker setup for services
+- Database configuration (MongoDB)
+- Authentication setup (Supabase)
+- Third-party service integrations (Azure, OpenAI, etc.)
+- Web portals (Store & Developer Console)
+
+**For App Development Only**: You can skip this section and use the production cloud at `https://api.mentra.glass`
+</Note>
+
+For a quick cloud setup overview:
 
 ```bash
 # Navigate to cloud directory
@@ -255,8 +271,6 @@ bun install
 # Create environment file
 cp .env.example .env
 ```
-
-**Note**: For external contributors, you'll need to set up accounts with various services. See the [Local Development Setup](local-setup) guide for detailed instructions.
 
 ## Step 3: Get Smart Glasses (Optional)
 

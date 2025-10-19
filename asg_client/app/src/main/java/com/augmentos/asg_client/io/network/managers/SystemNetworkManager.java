@@ -176,9 +176,33 @@ public class SystemNetworkManager extends BaseNetworkManager {
         // Get device-persistent credentials
         String ssid = getDeviceHotspotSsid();
         String password = getDeviceHotspotPassword();
-        
+
         Log.d(TAG, "Starting system hotspot with SSID: " + ssid);
-        
+
+        // IMPORTANT: Hotspot requires WiFi radio to be enabled (even if not connected)
+        // Check and enable WiFi if needed before starting hotspot
+        try {
+            if (!wifiManager.isWifiEnabled()) {
+                Log.d(TAG, "⚠️ WiFi radio is OFF - enabling WiFi radio for hotspot...");
+                boolean enabled = wifiManager.setWifiEnabled(true);
+                if (enabled) {
+                    Log.d(TAG, "✅ WiFi radio enabled successfully");
+                    // Give WiFi a moment to initialize
+                    try {
+                        Thread.sleep(500);
+                    } catch (InterruptedException e) {
+                        Log.w(TAG, "Sleep interrupted while waiting for WiFi radio", e);
+                    }
+                } else {
+                    Log.e(TAG, "❌ Failed to enable WiFi radio - hotspot may not start");
+                }
+            } else {
+                Log.d(TAG, "✅ WiFi radio already enabled");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error enabling WiFi radio for hotspot", e);
+        }
+
         try {
             boolean success = enableHotspotInternal(ssid, password);
             if (success) {
@@ -242,6 +266,35 @@ public class SystemNetworkManager extends BaseNetworkManager {
             notificationManager.showDebugNotification(
                     "WiFi Error", 
                     "Error connecting to WiFi: " + e.getMessage());
+        }
+    }
+    
+    @Override
+    public void disconnectFromWifi() {
+        Log.d(TAG, "Disconnecting from current WiFi network");
+        
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Modern Android - limited disconnect options due to security restrictions
+                Log.w(TAG, "Android 10+ has limited WiFi disconnect capabilities");
+                notificationManager.showDebugNotification(
+                        "WiFi Disconnect", 
+                        "Please disconnect manually via system settings");
+            } else {
+                // Legacy Android - can disconnect programmatically
+                if (wifiManager != null) {
+                    wifiManager.disconnect();
+                    notificationManager.showDebugNotification(
+                            "WiFi Disconnect", 
+                            "Disconnected from WiFi network");
+                    Log.d(TAG, "WiFi disconnect command sent");
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error disconnecting from WiFi", e);
+            notificationManager.showDebugNotification(
+                    "WiFi Error", 
+                    "Error disconnecting from WiFi: " + e.getMessage());
         }
     }
     

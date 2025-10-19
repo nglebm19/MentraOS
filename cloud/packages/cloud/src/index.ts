@@ -16,12 +16,12 @@ import pinoHttp from "pino-http";
 
 // Import services
 import { DebugService } from "./services/debug/debug-service";
-import { sessionService } from "./services/session/session.service";
+// sessionService consolidated into UserSession static APIs
 import { websocketService } from "./services/websocket/websocket.service";
 import * as AppUptimeService from "./services/core/app-uptime.service";
-import SessionStorage from "./services/session/SessionStorage";
+import UserSession from "./services/session/UserSession";
 // Register API routes from central index
-import { registerApi } from './api';
+import { registerApi } from "./api";
 
 // Load configuration from environment
 import * as mongoConnection from "./connections/mongodb.connection";
@@ -47,7 +47,9 @@ mongoConnection
     if (adminEmails) {
       const emails = adminEmails.split(",").map((e) => e.trim());
       logger.info(
-        `Admin access configured for ${emails.length} email(s): [${emails.join(", ")}]`,
+        `Admin access configured for ${emails.length} email(s): [${emails.join(
+          ", ",
+        )}]`,
       );
     } else {
       logger.warn(
@@ -75,7 +77,7 @@ const server = new Server(app);
 const debugService = new DebugService(server);
 
 // Export services for use in other modules
-export { sessionService, debugService, websocketService };
+export { debugService, websocketService };
 
 // Middleware setup
 app.use(helmet());
@@ -121,12 +123,12 @@ app.use(
       "https://consoledev.augmentos.org",
       "https://account.augmentos.org",
       "https://accountdev.augmentos.org",
-      "https://docs.mentra.glass",
       "https://docsdev.augmentos.org",
 
       "https://augmentos.pages.dev",
       "https://augmentos-appstore-2.pages.dev",
 
+      // mentra.glass API
       "https://mentra.glass",
       "https://api.mentra.glass",
       "https://dev.api.mentra.glass",
@@ -152,6 +154,33 @@ app.use(
       "https://dev.account.mentra.glass",
       "https://dev.docs.mentra.glass",
       "https://dev.store.mentra.glass",
+
+      // mentraglass.com API
+      "https://www.mentraglass.com",
+      "https://api.mentraglass.com",
+      "https://devapi.mentraglass.com",
+      "https://uscentralapi.mentraglass.com",
+      "https://franceapi.mentraglass.com",
+      "https://asiaeastapi.mentraglass.com",
+
+      "https://apps.mentraglass.com",
+      "https://console.mentraglass.com",
+      "https://account.mentraglass.com",
+      "https://docs.mentraglass.com",
+      "https://store.mentraglass.com",
+      "https://dev.mentraglass.com",
+
+      "https://appsdev.mentraglass.com",
+      "https://consoledev.mentraglass.com",
+      "https://accountdev.mentraglass.com",
+      "https://docsdev.mentraglass.com",
+      "https://storedev.mentraglass.com",
+
+      "https://dev.apps.mentraglass.com",
+      "https://dev.console.mentraglass.com",
+      "https://dev.account.mentraglass.com",
+      "https://dev.docs.mentraglass.com",
+      "https://dev.store.mentraglass.com",
     ],
   }),
 );
@@ -166,7 +195,9 @@ app.use(
     logger: rootLogger,
     genReqId: (req) => {
       // Generate correlation ID for each request
-      return `${req.method}-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+      return `${req.method}-${Date.now()}-${Math.random()
+        .toString(36)
+        .substring(2, 11)}`;
     },
     customLogLevel: (req, res, err) => {
       if (res.statusCode >= 400 && res.statusCode < 500) return "warn";
@@ -179,9 +210,28 @@ app.use(
     customErrorMessage: (req, res, err) => {
       return `${req.method} ${req.url} - ${res.statusCode} - ${err.message}`;
     },
-    // Don't log health check requests to reduce noise
+    // Reduce verbosity in development by excluding request/response details
+    serializers: {
+      req: (req) => ({
+        method: req.method,
+        url: req.url,
+        // Only include basic info, skip headers/body/params for cleaner logs
+      }),
+      res: (res) => ({
+        statusCode: res.statusCode,
+        // Skip verbose response headers
+      }),
+    },
+    // Don't log noisy or frequent requests
     autoLogging: {
-      ignore: (req) => req.url === "/health",
+      ignore: (req) => {
+        // Skip health checks, livekit token requests, and other noisy endpoints
+        return (
+          req.url === "/health" ||
+          req.url === "/api/livekit/token" ||
+          req.url?.startsWith("/api/livekit/token")
+        );
+      },
     },
   }),
 );
@@ -195,8 +245,7 @@ registerApi(app);
 // Health check endpoint
 app.get("/health", (req, res) => {
   try {
-    const sessionStorage = SessionStorage.getInstance();
-    const activeSessions = sessionStorage.getAllSessions();
+    const activeSessions = UserSession.getAllSessions();
 
     res.json({
       status: "ok",
@@ -215,7 +264,6 @@ app.get("/health", (req, res) => {
     });
   }
 });
-
 
 // Serve static files from the public directory
 app.use(express.static(path.join(__dirname, "./public")));
@@ -240,7 +288,7 @@ try {
     logger.info(`\n
         ☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️
         ☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️
-        ☁️☁️☁️      😎 MentraOS Cloud Server 🚀     
+        ☁️☁️☁️      😎 MentraOS Cloud Server 🚀
         ☁️☁️☁️      🌐 Listening on port ${PORT} 🌐
         ☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️
         ☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️☁️\n`);

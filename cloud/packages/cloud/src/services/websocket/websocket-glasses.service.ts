@@ -24,23 +24,23 @@ import {
   RequestSettings,
   RtmpStreamStatus,
   LocalTranscription,
-  SettingsUpdate,
   Vad,
 } from "@mentra/sdk";
 import UserSession from "../session/UserSession";
 import { logger as rootLogger } from "../logging/pino-logger";
-// import subscriptionService from "../session/subscription.service";
 import { PosthogService } from "../logging/posthog.service";
-import { sessionService } from "../session/session.service";
+// sessionService functionality has been consolidated into UserSession
 import { User } from "../../models/user.model";
 import { SYSTEM_DASHBOARD_PACKAGE_NAME } from "../core/app.service";
-import { locationService } from "../core/location.service";
 
 const SERVICE_NAME = "websocket-glasses.service";
 const logger = rootLogger.child({ service: SERVICE_NAME });
 
 // Constants
 const RECONNECT_GRACE_PERIOD_MS = 1000 * 60 * 1; // 1 minute
+
+// SAFETY FLAG: Set to false to disable grace period cleanup entirely
+const GRACE_PERIOD_CLEANUP_ENABLED = true; // Enable auto-cleanup when WebSocket disconnects
 
 const DEFAULT_AUGMENTOS_SETTINGS = {
   useOnboardMic: false,
@@ -97,13 +97,11 @@ export class GlassesWebSocketService {
     try {
       // Get user ID from request (attached during JWT verification)
       const userId = (request as any).userId;
+      const livekitRequested = (request as any).livekitRequested || false;
 
       if (!userId) {
         logger.error(
-          {
-            error: GlassesErrorCode.INVALID_TOKEN,
-            request,
-          },
+          { error: GlassesErrorCode.INVALID_TOKEN, request },
           "No user ID provided in request",
         );
         this.sendError(
@@ -115,20 +113,31 @@ export class GlassesWebSocketService {
       }
 
       // Create or retrieve user session
-      const { userSession, reconnection } = await sessionService.createSession(
+      const { userSession, reconnection } = await UserSession.createOrReconnect(
         ws,
         userId,
       );
       userSession.logger.info(
-        `Glasses WebSocket connection from user: ${userId}`,
+        `Glasses WebSocket connection from user: ${userId} (LiveKit: ${livekitRequested})`,
       );
 
+      // Store LiveKit preference in the session
+      userSession.livekitRequested = livekitRequested;
+
+      let i = 0;
       // Handle incoming messages
       ws.on("message", (data: WebSocket.Data, isBinary) => {
         try {
           // Handle binary message (audio data)
           if (isBinary) {
+            i++;
             // await this.handleBinaryMessage(userSession, data);
+            if (i % 10 === 0) {
+              logger.debug(
+                { service: "LiveKitManager" },
+                "[Websocket]Received binary message",
+              );
+            }
             userSession.audioManager.processAudioData(data);
             return;
           }
@@ -140,10 +149,16 @@ export class GlassesWebSocketService {
             // Handle connection initialization message
             const connectionInitMessage = message as ConnectionInit;
             userSession.logger.info(
-              `Received connection init message from glasses: ${JSON.stringify(connectionInitMessage)}`,
+              `Received connection init message from glasses: ${JSON.stringify(
+                connectionInitMessage,
+              )}`,
             );
             // If this is a reconnection, we can skip the initialization logic
-            this.handleConnectionInit(userSession, reconnection)
+            this.handleConnectionInit(
+              userSession,
+              reconnection,
+              userSession.livekitRequested || false,
+            )
               .then(() => {
                 userSession.logger.info(
                   `✅ Connection reinitialized for user: ${userSession.userId}`,
@@ -151,12 +166,34 @@ export class GlassesWebSocketService {
               })
               .catch((error) => {
                 userSession.logger.error(
-                  `❌ Failed to reinitialize connection for user: ${userSession.userId}`,
                   error,
+                  `❌ Failed to reinitialize connection for user: ${userSession.userId}`,
                 );
               });
             return;
           }
+
+          // Handle LiveKit init handshake (client requests LiveKit info)
+          // if (message.type === GlassesToCloudMessageType.LIVEKIT_INIT) {
+          //   userSession.liveKitManager
+          //     .handleLiveKitInit()
+          //     .then((info) => {
+          //       if (!info) return;
+          //       const livekitInfo: CloudToGlassesMessage = {
+          //         type: CloudToGlassesMessageType.LIVEKIT_INFO,
+          //         url: info.url,
+          //         roomName: info.roomName,
+          //         token: info.token,
+          //         timestamp: new Date(),
+          //       } as any;
+          //       ws.send(JSON.stringify(livekitInfo));
+          //       userSession.logger.info({ url: info.url, roomName: info.roomName, feature: 'livekit' }, 'Sent LIVEKIT_INFO (on LIVEKIT_INIT)');
+          //     })
+          //     .catch((e) => {
+          //       userSession.logger.warn({ e, feature: 'livekit' }, 'Failed LIVEKIT_INIT handling');
+          //     });
+          //   return;
+          // }
 
           // Process the message
           this.handleGlassesMessage(userSession, message)
@@ -167,8 +204,8 @@ export class GlassesWebSocketService {
             })
             .catch((error) => {
               userSession.logger.error(
-                `❌ Error processing message of type: ${message.type} for user: ${userId}`,
                 error,
+                `❌ Error processing message of type: ${message.type} for user: ${userId}`,
               );
             });
         } catch (error) {
@@ -187,7 +224,9 @@ export class GlassesWebSocketService {
       });
 
       // Handle connection initialization
-      this.handleConnectionInit(userSession, reconnection);
+      this.handleConnectionInit(userSession, reconnection, livekitRequested);
+
+      // NOTE: Do not auto-send LIVEKIT_INFO here to avoid unnecessary room usage.
 
       // Track connection in analytics
       PosthogService.trackEvent("glasses_connection", userId, {
@@ -251,13 +290,13 @@ export class GlassesWebSocketService {
             userSession,
             message as GlassesConnectionState,
           );
-          sessionService.relayMessageToApps(userSession, message);
+          userSession.relayMessageToApps(message);
           break;
 
         // Looks Good.
         case GlassesToCloudMessageType.VAD:
           await this.handleVad(userSession, message as Vad);
-          sessionService.relayMessageToApps(userSession, message);
+          userSession.relayMessageToApps(message);
           // TODO(isaiah): relay to Apps
           break;
 
@@ -266,12 +305,11 @@ export class GlassesWebSocketService {
             userSession,
             message as LocalTranscription,
           );
-          sessionService.relayMessageToApps(userSession, message);
+          userSession.relayMessageToApps(message);
           break;
 
         case GlassesToCloudMessageType.LOCATION_UPDATE:
-          await locationService.handleDeviceLocationUpdate(
-            userSession,
+          userSession.locationManager.updateFromWebsocket(
             message as LocationUpdate,
           );
           break;
@@ -282,10 +320,9 @@ export class GlassesWebSocketService {
             { service: SERVICE_NAME, message },
             "Calendar event received from glasses",
           );
-          userSession.subscriptionManager.cacheCalendarEvent(
+          userSession.calendarManager.updateEventFromWebsocket(
             message as CalendarEvent,
           );
-          sessionService.relayMessageToApps(userSession, message);
           break;
 
         // TODO(isaiah): verify logic
@@ -397,8 +434,14 @@ export class GlassesWebSocketService {
                 {
                   changedFields: changedKeys.map((key) => ({
                     key,
-                    from: `${(currentSettingsBeforeUpdate as Record<string, any>)[key]} (${typeof (currentSettingsBeforeUpdate as Record<string, any>)[key]})`,
-                    to: `${(newSettings as Record<string, any>)[key]} (${typeof (newSettings as Record<string, any>)[key]})`,
+                    from: `${
+                      (currentSettingsBeforeUpdate as Record<string, any>)[key]
+                    } (${typeof (
+                      currentSettingsBeforeUpdate as Record<string, any>
+                    )[key]})`,
+                    to: `${
+                      (newSettings as Record<string, any>)[key]
+                    } (${typeof (newSettings as Record<string, any>)[key]})`,
                   })),
                 },
                 "Changes detected in settings from core status update:",
@@ -493,13 +536,13 @@ export class GlassesWebSocketService {
             `Audio play response received from glasses/core`,
           );
           // Forward audio play response to Apps - we need to find the specific app that made the request
-          sessionService.relayAudioPlayResponseToApp(userSession, message);
+          userSession.relayAudioPlayResponseToApp(message);
           break;
 
         case GlassesToCloudMessageType.HEAD_POSITION:
           await this.handleHeadPosition(userSession, message as HeadPosition);
           // Also relay to Apps in case they want to handle head position events
-          sessionService.relayMessageToApps(userSession, message);
+          userSession.relayMessageToApps(message);
           break;
 
         // TODO(isaiah): Add other message type handlers as needed
@@ -509,12 +552,12 @@ export class GlassesWebSocketService {
           userSession.logger.debug(
             `Relaying message type ${message.type} to Apps for user: ${userId}`,
           );
-          sessionService.relayMessageToApps(userSession, message);
+          userSession.relayMessageToApps(message);
           // TODO(isaiah): Verify Implemention message relaying to Apps
           break;
       }
     } catch (error) {
-      userSession.logger.error("Error handling glasses message:", error);
+      userSession.logger.error(error, "Error handling glasses message:");
     }
   }
 
@@ -522,10 +565,13 @@ export class GlassesWebSocketService {
    * Handle connection init
    *
    * @param userSession User session
+   * @param reconnection Whether this is a reconnection
+   * @param livekitRequested Whether the client requested LiveKit transport
    */
   private async handleConnectionInit(
     userSession: UserSession,
     reconnection: boolean,
+    livekitRequested = false,
   ): Promise<void> {
     if (!reconnection) {
       // Start all the apps that the user has running.
@@ -554,15 +600,52 @@ export class GlassesWebSocketService {
       });
     }
 
-    // const ackMessage: CloudConnectionAckMessage = {
+    // Prepare the base ACK message
     const ackMessage: ConnectionAck = {
       type: CloudToGlassesMessageType.CONNECTION_ACK,
       sessionId: userSession.sessionId,
-      userSession:
-        await sessionService.transformUserSessionForClient(userSession),
+      // userSession: await userSession.snapshotForClient(),
       timestamp: new Date(),
     };
 
+    // If LiveKit was requested, initialize and include the info
+    if (livekitRequested) {
+      try {
+        const livekitInfo =
+          await userSession.liveKitManager.handleLiveKitInit();
+        if (livekitInfo) {
+          (ackMessage as any).livekit = {
+            url: livekitInfo.url,
+            roomName: livekitInfo.roomName,
+            token: livekitInfo.token,
+          };
+          userSession.logger.info(
+            {
+              url: livekitInfo.url,
+              roomName: livekitInfo.roomName,
+              feature: "livekit",
+            },
+            "Included LiveKit info in CONNECTION_ACK",
+          );
+          userSession.logger.debug(
+            {
+              ackMessage,
+              feature: "connection",
+            },
+            "Sent CONNECTION_ACK",
+          );
+        }
+      } catch (error) {
+        userSession.logger.warn(
+          {
+            error,
+            feature: "livekit",
+          },
+          "Failed to initialize LiveKit for CONNECTION_ACK",
+        );
+      }
+    }
+    // TODO(isaiah): Think about weird edge case where it connects with livekit, then a reconnect without livekit. (should probably never happen, unless they change devices  mid-session and the new device doesn't want livekit)
     userSession.websocket.send(JSON.stringify(ackMessage));
   }
 
@@ -656,35 +739,6 @@ export class GlassesWebSocketService {
   }
 
   /**
-   * Handle location update message
-   *
-   */
-  private async handleLocationUpdate(
-    userSession: UserSession,
-    message: LocationUpdate,
-  ): Promise<void> {
-    userSession.logger.debug(
-      { message, service: SERVICE_NAME },
-      "Location update received from glasses",
-    );
-    try {
-      // The core logic is now handled by the central LocationService to manage caching and polling.
-      await locationService.handleDeviceLocationUpdate(userSession, message);
-
-      // We still relay the message to any apps subscribed to the raw location stream.
-      // The locationService's handleDeviceLocationUpdate will decide if it needs to send a specific
-      // response for a poll request.
-      sessionService.relayMessageToApps(userSession, message);
-    } catch (error) {
-      userSession.logger.error(
-        { error, service: SERVICE_NAME },
-        `Error handling location update:`,
-        error,
-      );
-    }
-  }
-
-  /**
    * Handle head position event message
    *
    * @param userSession User session
@@ -755,17 +809,41 @@ export class GlassesWebSocketService {
       { service: SERVICE_NAME, message },
       `handleGlassesConnectionState for user ${userSession.userId}`,
     );
-    userSession.microphoneManager.handleConnectionStateChange(
+    await userSession.deviceManager.handleGlassesConnectionState(
+      glassesConnectionStateMessage.modelName || null,
       glassesConnectionStateMessage.status,
     );
+    return;
 
     // Extract glasses model information
     const modelName = glassesConnectionStateMessage.modelName;
     const isConnected = glassesConnectionStateMessage.status === "CONNECTED";
 
+    // Update connection state tracking in UserSession
+    const wasConnected = userSession.glassesConnected;
+    userSession.glassesConnected = isConnected;
+    userSession.glassesModel = modelName;
+    userSession.lastGlassesStatusUpdate = new Date();
+
     // Update glasses model in session when connected and model name is available
     if (isConnected && modelName) {
       await userSession.updateGlassesModel(modelName);
+    }
+
+    // Log connection state change if state changed
+    if (wasConnected !== isConnected) {
+      userSession.logger.info(
+        {
+          previousState: wasConnected,
+          newState: isConnected,
+          model: modelName,
+          userId: userSession.userId,
+        },
+        `Glasses connection state changed from ${wasConnected} to ${isConnected} for user ${userSession.userId}`,
+      );
+
+      // The existing relayMessageToApps call below will notify subscribed apps
+      // No need for additional broadcasting
     }
 
     try {
@@ -872,7 +950,7 @@ export class GlassesWebSocketService {
         "Sent settings update",
       );
     } catch (error) {
-      userSession.logger.error("Error sending settings:", error);
+      userSession.logger.error(error, "Error sending settings:");
       const errorMessage: ConnectionError = {
         type: CloudToGlassesMessageType.CONNECTION_ERROR,
         message: "Error retrieving settings",
@@ -922,7 +1000,7 @@ export class GlassesWebSocketService {
 
       userSession.websocket.send(JSON.stringify(responseMessage));
     } catch (error) {
-      userSession.logger.error("Error retrieving AugmentOS settings:", error);
+      userSession.logger.error(error, "Error retrieving AugmentOS settings:");
 
       // Send error back to client
       const errorMessage = {
@@ -964,21 +1042,17 @@ export class GlassesWebSocketService {
     // Disconnecting is probably a network issue and the user will likely reconnect.
     // So we don't want to end the session immediately, but rather wait for a grace period
     // to see if the user reconnects.
-    // Stop transcription
-    // if (userSession.isTranscribing) {
-    //   userSession.isTranscribing = false;
-    //   try {
-    //     await userSession.transcriptionManager.stopAndFinalizeAll();
-    //   } catch (error) {
-    //     userSession.logger.error({ error }, 'Error stopping transcription on disconnect');
-    //   }
-    // }
 
     // Mark as disconnected
     userSession.disconnectedAt = new Date();
 
-    // Set cleanup timer if not already set
-    if (!userSession.cleanupTimerId) {
+    // Set cleanup timer if not already set (and if cleanup is enabled)
+    if (!GRACE_PERIOD_CLEANUP_ENABLED) {
+      userSession.logger.debug(
+        { service: SERVICE_NAME },
+        `Grace period cleanup disabled by GRACE_PERIOD_CLEANUP_ENABLED=false for user: ${userSession.userId}`,
+      );
+    } else if (!userSession.cleanupTimerId) {
       userSession.cleanupTimerId = setTimeout(() => {
         userSession.logger.debug(
           { service: SERVICE_NAME },
@@ -1087,12 +1161,12 @@ export class GlassesWebSocketService {
       ws.send(JSON.stringify(errorMessage));
       ws.close(1008, message);
     } catch (error) {
-      logger.error("Error sending error message to glasses:", error);
+      logger.error(error, "Error sending error message to glasses:");
 
       try {
         ws.close(1011, "Internal server error");
       } catch (closeError) {
-        logger.error("Error closing WebSocket connection:", closeError);
+        logger.error(closeError, "Error closing WebSocket connection:");
       }
     }
   }

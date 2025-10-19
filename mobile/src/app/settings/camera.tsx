@@ -1,5 +1,6 @@
-import React, {useEffect, useState} from "react"
-import {View, Text, ScrollView, StyleSheet, TouchableOpacity} from "react-native"
+import {useEffect, useState} from "react"
+import {View, ScrollView, TouchableOpacity, Platform} from "react-native"
+import {Text} from "@/components/ignite"
 import {useCoreStatus} from "@/contexts/CoreStatusProvider"
 import bridge from "@/bridge/MantleBridge"
 import {useAppTheme} from "@/utils/useAppTheme"
@@ -10,14 +11,14 @@ import {translate} from "@/i18n"
 import {useNavigationHistory} from "@/contexts/NavigationHistoryContext"
 import ToggleSetting from "@/components/settings/ToggleSetting"
 import {Screen, Header} from "@/components/ignite"
-import {loadSetting} from "@/utils/SettingsHelper"
-import {SETTINGS_KEYS} from "@/utils/SettingsHelper"
 import {isDeveloperBuildOrTestflight} from "@/utils/buildDetection"
 import {useAuth} from "@/contexts/AuthContext"
 import {isMentraUser} from "@/utils/isMentraUser"
+import {SETTINGS_KEYS, useSetting, useSettingsStore} from "@/stores/settings"
 
 type PhotoSize = "small" | "medium" | "large"
 type VideoResolution = "720p" | "1080p" | "1440p" | "4K"
+type MaxRecordingTime = "3m" | "5m" | "10m" | "15m" | "20m"
 
 const PHOTO_SIZE_LABELS: Record<PhotoSize, string> = {
   small: "Small (800×600)",
@@ -32,13 +33,20 @@ const VIDEO_RESOLUTION_LABELS: Record<VideoResolution, string> = {
   "4K": "4K (3840×2160)",
 }
 
+const MAX_RECORDING_TIME_LABELS: Record<MaxRecordingTime, string> = {
+  "3m": "3 minutes",
+  "5m": "5 minutes",
+  "10m": "10 minutes",
+  "15m": "15 minutes",
+  "20m": "20 minutes",
+}
+
 export default function CameraSettingsScreen() {
   const {theme, themed} = useAppTheme()
   const {status} = useCoreStatus()
   const {goBack} = useNavigationHistory()
   const {user} = useAuth()
-
-  const [devMode, setDevMode] = useState(false)
+  const [devMode, setDevMode] = useSetting(SETTINGS_KEYS.dev_mode)
 
   // Local state for optimistic updates - initialize from status
   const [photoSize, setPhotoSize] = useState<PhotoSize>(
@@ -56,6 +64,15 @@ export default function CameraSettingsScreen() {
       return "720p"
     }
     return "720p"
+  })
+  const [maxRecordingTime, setMaxRecordingTime] = useState<MaxRecordingTime>(() => {
+    const maxTime = status.glasses_settings?.button_max_recording_time_minutes
+    if (maxTime === 3) return "3m"
+    if (maxTime === 5) return "5m"
+    if (maxTime === 10) return "10m"
+    if (maxTime === 15) return "15m"
+    if (maxTime === 20) return "20m"
+    return "10m" // default to 10 minutes
   })
 
   // Update local state when status changes
@@ -82,8 +99,19 @@ export default function CameraSettingsScreen() {
   }, [status.glasses_settings?.button_video_settings])
 
   useEffect(() => {
+    const maxTime = status.glasses_settings?.button_max_recording_time_minutes
+    if (maxTime !== undefined) {
+      if (maxTime === 3) setMaxRecordingTime("3m")
+      else if (maxTime === 5) setMaxRecordingTime("5m")
+      else if (maxTime === 10) setMaxRecordingTime("10m")
+      else if (maxTime === 15) setMaxRecordingTime("15m")
+      else if (maxTime === 20) setMaxRecordingTime("20m")
+    }
+  }, [status.glasses_settings?.button_max_recording_time_minutes])
+
+  useEffect(() => {
     const checkDevMode = async () => {
-      const devModeSetting = await loadSetting(SETTINGS_KEYS.DEV_MODE, false)
+      const devModeSetting = await useSettingsStore.getState().loadSetting(SETTINGS_KEYS.dev_mode)
       setDevMode(isDeveloperBuildOrTestflight() || isMentraUser(user?.email) || devModeSetting)
     }
     checkDevMode()
@@ -153,6 +181,33 @@ export default function CameraSettingsScreen() {
     }
   }
 
+  const handleMaxRecordingTimeChange = async (time: MaxRecordingTime) => {
+    if (!status.core_info.puck_connected || !status.glasses_info?.model_name) {
+      console.log("Cannot change max recording time - glasses not connected")
+      return
+    }
+
+    try {
+      setMaxRecordingTime(time) // Optimistic update
+
+      // Convert time to minutes
+      const minutes = parseInt(time.replace("m", ""))
+
+      await bridge.sendSetButtonMaxRecordingTime(minutes)
+    } catch (error) {
+      console.error("Failed to update max recording time:", error)
+      // Revert on error
+      const maxTime = status.glasses_settings?.button_max_recording_time_minutes
+      if (maxTime !== undefined) {
+        if (maxTime === 3) setMaxRecordingTime("3m")
+        else if (maxTime === 5) setMaxRecordingTime("5m")
+        else if (maxTime === 10) setMaxRecordingTime("10m")
+        else if (maxTime === 15) setMaxRecordingTime("15m")
+        else if (maxTime === 20) setMaxRecordingTime("20m")
+      }
+    }
+  }
+
   // Check if glasses support camera button feature
   const supportsCameraButton = status.glasses_info?.model_name?.toLowerCase().includes("mentra live")
 
@@ -185,7 +240,7 @@ export default function CameraSettingsScreen() {
                 <MaterialCommunityIcons
                   name="check"
                   size={24}
-                  color={photoSize === value ? theme.colors.checkmark : "transparent"}
+                  color={photoSize === value ? theme.colors.primary : "transparent"}
                 />
               </TouchableOpacity>
             </View>
@@ -206,12 +261,35 @@ export default function CameraSettingsScreen() {
                 <MaterialCommunityIcons
                   name="check"
                   size={24}
-                  color={videoResolution === value ? theme.colors.checkmark : "transparent"}
+                  color={videoResolution === value ? theme.colors.primary : "transparent"}
                 />
               </TouchableOpacity>
             </View>
           ))}
         </View>
+
+        {Platform.OS === "ios" && (
+          <View style={themed($settingsGroup)}>
+            <Text style={themed($settingLabel)}>Maximum Recording Time</Text>
+            <Text style={themed($settingSubtitle)}>Maximum duration for button-triggered video recording</Text>
+
+            {Object.entries(MAX_RECORDING_TIME_LABELS).map(([value, label], index) => (
+              <View key={value}>
+                {index > 0 && <View style={themed($divider)} />}
+                <TouchableOpacity
+                  style={themed($optionItem)}
+                  onPress={() => handleMaxRecordingTimeChange(value as MaxRecordingTime)}>
+                  <Text style={themed($optionText)}>{label}</Text>
+                  <MaterialCommunityIcons
+                    name="check"
+                    size={24}
+                    color={maxRecordingTime === value ? theme.colors.primary : "transparent"}
+                  />
+                </TouchableOpacity>
+              </View>
+            ))}
+          </View>
+        )}
 
         {devMode && (
           <View style={{marginVertical: theme.spacing.sm}}>
@@ -234,14 +312,8 @@ export default function CameraSettingsScreen() {
   )
 }
 
-const $loadingContainer: ThemedStyle<ViewStyle> = () => ({
-  flex: 1,
-  justifyContent: "center",
-  alignItems: "center",
-})
-
 const $settingsGroup: ThemedStyle<ViewStyle> = ({colors, spacing}) => ({
-  backgroundColor: colors.background,
+  backgroundColor: colors.backgroundAlt,
   paddingVertical: 12,
   paddingHorizontal: 16,
   borderRadius: spacing.md,
@@ -272,7 +344,7 @@ const $optionItem: ThemedStyle<ViewStyle> = ({spacing}) => ({
 })
 
 const $divider: ThemedStyle<ViewStyle> = ({colors}) => ({
-  height: StyleSheet.hairlineWidth,
+  height: 1,
   backgroundColor: colors.separator,
   marginVertical: 4,
 })
@@ -283,14 +355,14 @@ const $optionText: ThemedStyle<TextStyle> = ({colors}) => ({
 })
 
 const $warningContainer: ThemedStyle<ViewStyle> = ({spacing, colors}) => ({
-  backgroundColor: colors.warningBackground || "#fff3cd",
+  backgroundColor: colors.warning,
   padding: spacing.md,
   margin: spacing.md,
   borderRadius: spacing.xs,
 })
 
 const $warningText: ThemedStyle<TextStyle> = ({colors}) => ({
-  color: colors.warningText || "#856404",
+  color: colors.textDim,
   textAlign: "center",
 })
 

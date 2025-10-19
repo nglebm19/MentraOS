@@ -22,10 +22,8 @@ import {
 import { logger as rootLogger } from "../logging/pino-logger";
 import { SimplePermissionChecker } from "../permissions/simple-permission-checker";
 import App from "../../models/app.model";
-import { sessionService } from "./session.service";
 import UserSession from "./UserSession";
 import { User, UserI } from "../../models/user.model";
-import { locationService } from "../core/location.service";
 import { MongoSanitizer } from "../../utils/mongoSanitizer";
 
 const logger = rootLogger.child({ service: "subscription.service" });

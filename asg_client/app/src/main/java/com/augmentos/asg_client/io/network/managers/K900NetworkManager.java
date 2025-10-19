@@ -158,8 +158,28 @@ public class K900NetworkManager extends BaseNetworkManager {
         Log.d(TAG, "🔥 =========================================");
         Log.d(TAG, "🔥 START K900 HOTSPOT (INTENT MODE)");
         Log.d(TAG, "🔥 =========================================");
-        
+
         try {
+            // IMPORTANT: Hotspot requires WiFi radio to be enabled (even if not connected)
+            // Check and enable WiFi if needed before starting hotspot
+            if (!wifiManager.isWifiEnabled()) {
+                Log.d(TAG, "🔥 ⚠️ WiFi radio is OFF - enabling WiFi radio for hotspot...");
+                boolean enabled = wifiManager.setWifiEnabled(true);
+                if (enabled) {
+                    Log.d(TAG, "🔥 ✅ WiFi radio enabled successfully");
+                    // Give WiFi a moment to initialize
+                    try {
+                        Thread.sleep(500);
+                    } catch (InterruptedException e) {
+                        Log.w(TAG, "Sleep interrupted while waiting for WiFi radio", e);
+                    }
+                } else {
+                    Log.e(TAG, "🔥 ❌ Failed to enable WiFi radio - hotspot may not start");
+                }
+            } else {
+                Log.d(TAG, "🔥 ✅ WiFi radio already enabled");
+            }
+
             // Send K900 hotspot enable intent
             Log.d(TAG, "🔥 📡 Sending K900 hotspot enable intent...");
             Intent intent = new Intent();
@@ -325,7 +345,32 @@ public class K900NetworkManager extends BaseNetworkManager {
                     "Failed to connect to WiFi: " + e.getMessage());
         }
     }
-    
+
+    @Override
+    public void disconnectFromWifi() {
+        Log.d(TAG, "📶 =========================================");
+        Log.d(TAG, "📶 DISCONNECT FROM WIFI");
+        Log.d(TAG, "📶 =========================================");
+        
+        try {
+            // Use SysControl for K900 WiFi disconnection
+            Log.d(TAG, "📶 📡 Disconnecting from WiFi via SysControl...");
+            SysControl.disconnectFromWifi(context);
+            
+            Log.d(TAG, "📶 ✅ WiFi disconnect command sent successfully");
+            notificationManager.showDebugNotification(
+                    "WiFi Disconnection", 
+                    "Disconnecting from current network");
+            
+            Log.i(TAG, "📶 ✅ WiFi disconnect command sent");
+        } catch (Exception e) {
+            Log.e(TAG, "📶 💥 Error disconnecting from WiFi", e);
+            notificationManager.showDebugNotification(
+                    "WiFi Error", 
+                    "Failed to disconnect from WiFi: " + e.getMessage());
+        }
+    }
+
     private void promptConnectToWifi(String ssid, String password) {
         // K900-specific method to prompt user for WiFi connection
         try {

@@ -12,11 +12,13 @@ import BleManager from "react-native-ble-manager"
 import AudioPlayService, {AudioPlayResponse} from "@/services/AudioPlayService"
 import {translate} from "@/i18n"
 import {CoreStatusParser} from "@/utils/CoreStatusParser"
-import {getCoreSettings, getRestUrl, getWsUrl} from "@/utils/SettingsHelper"
 import socketComms from "@/managers/SocketComms"
+import livekitManager from "@/managers/LivekitManager"
+import mantle from "@/managers/MantleManager"
+import {useSettingsStore, SETTINGS_KEYS} from "@/stores/settings"
 
-const {Bridge, BridgeModule, CoreCommsService} = NativeModules
-const eventEmitter = new NativeEventEmitter(Bridge)
+const {BridgeModule, CoreCommsService} = NativeModules
+const coreBridge = new NativeEventEmitter(BridgeModule)
 
 export class MantleBridge extends EventEmitter {
   private static instance: MantleBridge | null = null
@@ -165,12 +167,13 @@ export class MantleBridge extends EventEmitter {
    * Initializes the communication channel with Core
    */
   async initialize() {
-    if (Platform.OS === "ios") {
-      setTimeout(async () => {
-        // will fail silently if we don't have bt permissions (which is the intended behavior)
-        BridgeModule.sendCommand(JSON.stringify({command: "connect_wearable"}))
-      }, 3000)
-    }
+    setTimeout(async () => {
+      const defaultWearable = await useSettingsStore.getState().getSetting(SETTINGS_KEYS.default_wearable)
+      const deviceName = await useSettingsStore.getState().getSetting(SETTINGS_KEYS.device_name)
+      if (defaultWearable && defaultWearable != "" && deviceName && deviceName != "") {
+        this.sendConnectWearable(defaultWearable, deviceName)
+      }
+    }, 3000)
 
     // Start the external service
     startExternalService()
@@ -178,18 +181,13 @@ export class MantleBridge extends EventEmitter {
     // Initialize message event listener
     this.initializeMessageEventListener()
 
+    // set the backend server url
     if (Platform.OS === "android") {
-      // Set up audio play response callback
-      AudioPlayService.setResponseCallback((response: AudioPlayResponse) => {
-        this.sendAudioPlayResponse(response)
-      })
+      const backendServerUrl = await useSettingsStore.getState().getRestUrl() // TODO: config: remove
+      await this.setServerUrl(backendServerUrl) // TODO: config: remove
     }
 
-    // set the backend server url
-    const backendServerUrl = await getRestUrl()
-    await this.setServerUrl(backendServerUrl) // todo: config: remove
-
-    this.sendSettings() // TODO: config: finish this
+    this.sendSettings()
 
     // Start periodic status checks
     this.startStatusPolling()
@@ -209,7 +207,7 @@ export class MantleBridge extends EventEmitter {
     }
 
     // Create a fresh subscription
-    this.messageEventSubscription = eventEmitter.addListener("CoreMessageEvent", this.handleCoreMessage.bind(this))
+    this.messageEventSubscription = coreBridge.addListener("CoreMessageEvent", this.handleCoreMessage.bind(this))
 
     console.log("Core message event listener initialized")
   }
@@ -232,7 +230,6 @@ export class MantleBridge extends EventEmitter {
       return
     }
 
-    // console.log("RECEIVED MESSAGE FROM CORE")
     try {
       const data = JSON.parse(jsonString)
 
@@ -243,19 +240,6 @@ export class MantleBridge extends EventEmitter {
           return
         }
         this.lastMessage = jsonString
-      }
-
-      // Log if this is a WiFi scan result
-      if ("wifi_scan_results" in data) {
-        console.log("📡 ========= RAW MESSAGE FROM CORE =========")
-        console.log("📡 Raw JSON string:", jsonString)
-        console.log("📡 Parsed data:", data)
-        console.log("📡 ========= END RAW MESSAGE =========")
-      }
-
-      // Log if this is a gallery status result
-      if ("glasses_gallery_status" in data) {
-        console.log("📸 Gallery status received from Core:", data.glasses_gallery_status)
       }
 
       this.isConnected = true
@@ -275,10 +259,11 @@ export class MantleBridge extends EventEmitter {
 
     try {
       if ("status" in data) {
-        this.emit("statusUpdateReceived", data)
+        GlobalEventEmitter.emit("CORE_STATUS_UPDATE", data)
         return
       }
 
+      // TODO: config: remove all of these and just use the typed messages
       if ("glasses_wifi_status_change" in data) {
         // console.log("Received glasses_wifi_status_change event from Core", data.glasses_wifi_status_change)
         GlobalEventEmitter.emit("GLASSES_WIFI_STATUS_CHANGE", {
@@ -304,10 +289,29 @@ export class MantleBridge extends EventEmitter {
           camera_busy: data.glasses_gallery_status.camera_busy, // Add camera busy state
         })
       } else if ("glasses_display_event" in data) {
-        // TODO: config: remove
-        GlobalEventEmitter.emit("GLASSES_DISPLAY_EVENT", data.glasses_display_event)
+        console.log(
+          "🎯 MantleBridge: RECEIVED GLASSES_DISPLAY_EVENT from Android Core:",
+          JSON.stringify(data.glasses_display_event, null, 2),
+        )
+
+        // Extract and log text content from the display event
+        const displayEvent = data.glasses_display_event
+
+        // TODO: remove this once we have a proper display event handling system
+        socketComms.handle_display_event(displayEvent)
+        console.log("✅ MantleBridge: Android display event processed successfully")
       } else if ("ping" in data) {
         // Heartbeat response - nothing to do
+      } else if ("heartbeat_sent" in data) {
+        console.log("💓 Received heartbeat_sent event from Core", data.heartbeat_sent)
+        GlobalEventEmitter.emit("heartbeat_sent", {
+          timestamp: data.heartbeat_sent.timestamp,
+        })
+      } else if ("heartbeat_received" in data) {
+        console.log("💓 Received heartbeat_received event from Core", data.heartbeat_received)
+        GlobalEventEmitter.emit("heartbeat_received", {
+          timestamp: data.heartbeat_received.timestamp,
+        })
       } else if ("notify_manager" in data) {
         GlobalEventEmitter.emit("SHOW_BANNER", {
           message: translate(data.notify_manager.message),
@@ -317,17 +321,11 @@ export class MantleBridge extends EventEmitter {
         GlobalEventEmitter.emit("COMPATIBLE_GLASSES_SEARCH_RESULT", {
           modelName: data.compatible_glasses_search_result.model_name,
           deviceName: data.compatible_glasses_search_result.device_name,
+          deviceAddress: data.compatible_glasses_search_result.device_address,
         })
       } else if ("compatible_glasses_search_stop" in data) {
         GlobalEventEmitter.emit("COMPATIBLE_GLASSES_SEARCH_STOP", {
           modelName: data.compatible_glasses_search_stop.model_name,
-        })
-      } else if ("need_permissions" in data) {
-        GlobalEventEmitter.emit("NEED_PERMISSIONS")
-      } else if ("need_wifi_credentials" in data) {
-        console.log("Received need_wifi_credentials event from Core")
-        GlobalEventEmitter.emit("GLASSES_NEED_WIFI_CREDENTIALS", {
-          deviceModel: data.device_model,
         })
       } else if ("wifi_scan_results" in data) {
         console.log("🔍 ========= WIFI SCAN RESULTS RECEIVED =========")
@@ -357,6 +355,9 @@ export class MantleBridge extends EventEmitter {
         return
       }
 
+      let binaryString
+      let bytes
+
       switch (data.type) {
         case "app_started":
           console.log("APP_STARTED_EVENT", data.packageName)
@@ -366,11 +367,22 @@ export class MantleBridge extends EventEmitter {
           console.log("APP_STOPPED_EVENT", data.packageName)
           GlobalEventEmitter.emit("APP_STOPPED_EVENT", data.packageName)
           break
+        case "button_press":
+          console.log("🔘 BUTTON_PRESS event received:", data)
+          // Emit event to React Native layer for handling
+          GlobalEventEmitter.emit("BUTTON_PRESS", {
+            buttonId: data.buttonId,
+            pressType: data.pressType,
+            timestamp: data.timestamp,
+          })
+          // Also forward to server for apps that need it
+          socketComms.sendButtonPress(data.buttonId, data.pressType)
+          break
         case "audio_play_request":
-          await AudioPlayService.handleAudioPlayRequest(data)
+          await AudioPlayService.handle_audio_play_request(data)
           break
         case "audio_stop_request":
-          await AudioPlayService.stopAllAudio()
+          await bridge.sendCommand("audio_stop_request")
           break
         case "wifi_scan_results":
           GlobalEventEmitter.emit("WIFI_SCAN_RESULTS", {
@@ -387,16 +399,49 @@ export class MantleBridge extends EventEmitter {
             type: data.type,
           })
           break
+        case "save_setting":
+          await useSettingsStore.getState().setSetting(data.key, data.value, false)
+          break
+        case "head_up":
+          socketComms.sendHeadPosition(data.position)
+          break
+        // TODO: config: remove (this is legacy/android only)
+        case "transcription_result":
+          mantle.handleLocalTranscription(data)
+          break
+        case "local_transcription":
+          mantle.handleLocalTranscription(data)
+          break
         case "ws_text":
           socketComms.sendText(data.text)
           break
-        case "ws_binary":
-          const binaryString = atob(data.binary)
-          const bytes = new Uint8Array(binaryString.length)
+        case "ws_bin":
+          binaryString = atob(data.base64)
+          bytes = new Uint8Array(binaryString.length)
           for (let i = 0; i < binaryString.length; i++) {
             bytes[i] = binaryString.charCodeAt(i)
           }
           socketComms.sendBinary(bytes)
+          break
+        case "mic_data":
+          binaryString = atob(data.base64)
+          bytes = new Uint8Array(binaryString.length)
+          for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i)
+          }
+          if (livekitManager.isRoomConnected()) {
+            livekitManager.addPcm(bytes)
+          } else {
+            socketComms.sendBinary(bytes)
+          }
+          break
+        case "rtmp_stream_status":
+          console.log("MantleBridge: Forwarding RTMP stream status to server:", data)
+          socketComms.sendRtmpStreamStatus(data)
+          break
+        case "keep_alive_ack":
+          console.log("MantleBridge: Forwarding keep-alive ACK to server:", data)
+          socketComms.sendKeepAliveAck(data)
           break
         default:
           console.log("Unknown event type:", data.type)
@@ -404,8 +449,15 @@ export class MantleBridge extends EventEmitter {
       }
     } catch (e) {
       console.error("Error parsing data from Core:", e)
-      this.emit("statusUpdateReceived", CoreStatusParser.defaultStatus)
+      GlobalEventEmitter.emit("CORE_STATUS_UPDATE", CoreStatusParser.defaultStatus)
     }
+  }
+
+  private async sendSettings() {
+    this.sendData({
+      command: "update_settings",
+      params: {...(await useSettingsStore.getState().getCoreSettings())},
+    })
   }
 
   /**
@@ -443,7 +495,7 @@ export class MantleBridge extends EventEmitter {
       return this.validationInProgress ?? true
     }
 
-    this.validationInProgress = new Promise<boolean>((resolve, reject) => {
+    this.validationInProgress = new Promise<boolean>((resolve, _reject) => {
       const dataReceivedListener = () => {
         resolve(true)
       }
@@ -508,7 +560,7 @@ export class MantleBridge extends EventEmitter {
     this.isConnected = false
 
     // Reset the singleton instance
-    Bridge.instance = null
+    MantleBridge.instance = null
 
     console.log("Bridge cleaned up")
   }
@@ -534,12 +586,20 @@ export class MantleBridge extends EventEmitter {
     })
   }
 
-  async sendConnectWearable(modelName: string, deviceName: string = "") {
+  async sendConnectWearable(modelName: string, deviceName: string = "", deviceAddress: string = "") {
+    console.log(
+      "sendConnectWearable modelName:",
+      modelName,
+      " deviceName",
+      deviceName,
+      " deviceAddress " + deviceAddress,
+    )
     return await this.sendData({
       command: "connect_wearable",
       params: {
         model_name: modelName,
         device_name: deviceName,
+        device_address: deviceAddress,
       },
     })
   }
@@ -609,11 +669,18 @@ export class MantleBridge extends EventEmitter {
     })
   }
 
-  async sendSetButtonMode(mode: string) {
+  // DEPRECATED: Button mode is now controlled by gallery mode state
+  // Keeping method for backward compatibility but it does nothing
+  async sendSetButtonMode(_mode: string) {
+    console.log("sendSetButtonMode is deprecated - gallery mode controls capture now")
+    return Promise.resolve()
+  }
+
+  async sendGalleryModeActive(active: boolean) {
     return await this.sendData({
-      command: "set_button_mode",
+      command: "send_gallery_mode_active",
       params: {
-        mode: mode,
+        active: active,
       },
     })
   }
@@ -634,6 +701,15 @@ export class MantleBridge extends EventEmitter {
         width: width,
         height: height,
         fps: fps,
+      },
+    })
+  }
+
+  async sendSetButtonMaxRecordingTime(minutes: number) {
+    return await this.sendData({
+      command: "set_button_max_recording_time",
+      params: {
+        minutes: minutes,
       },
     })
   }
@@ -691,6 +767,16 @@ export class MantleBridge extends EventEmitter {
   async sendToggleEnforceLocalTranscription(enabled: boolean) {
     return await this.sendData({
       command: "enforce_local_transcription",
+      params: {
+        enabled: enabled,
+      },
+    })
+  }
+
+  async toggleOfflineApps(enabled: boolean) {
+    console.log("toggleOfflineApss", enabled)
+    return await this.sendData({
+      command: "enable_offline_mode",
       params: {
         enabled: enabled,
       },
@@ -846,18 +932,6 @@ export class MantleBridge extends EventEmitter {
     })
   }
 
-  async verifyAuthenticationSecretKey() {
-    return await this.sendData({
-      command: "verify_auth_secret_key",
-    })
-  }
-
-  async deleteAuthenticationSecretKey() {
-    return await this.sendData({
-      command: "delete_auth_secret_key",
-    })
-  }
-
   async setGlassesWifiCredentials(ssid: string, password: string) {
     return await this.sendData({
       command: "set_glasses_wifi_credentials",
@@ -882,6 +956,13 @@ export class MantleBridge extends EventEmitter {
   async requestWifiScan() {
     return await this.sendData({
       command: "request_wifi_scan",
+    })
+  }
+
+  async disconnectFromWifi() {
+    console.log("Sending WiFi disconnect command to Core")
+    return await this.sendData({
+      command: "disconnect_wifi",
     })
   }
 
@@ -934,6 +1015,43 @@ export class MantleBridge extends EventEmitter {
     })
   }
 
+  async sendDisplayText(text: string, x: number, y: number, size: number) {
+    console.log("sendDisplayText", text, x, y, size)
+
+    return await this.sendData({
+      command: "display_text",
+      params: {
+        text: text,
+        x: x,
+        y: y,
+        size: size,
+      },
+    })
+  }
+
+  async sendDisplayImage(imageType: string, imageSize: string) {
+    return await this.sendData({
+      command: "display_image",
+      params: {
+        imageType: imageType,
+        imageSize: imageSize,
+      },
+    })
+  }
+
+  async sendClearDisplay() {
+    return await this.sendData({
+      command: "clear_display",
+    })
+  }
+
+  async setLc3AudioEnabled(enabled: boolean) {
+    console.log("setLc3AudioEnabled", enabled)
+    return await this.sendData({
+      command: "set_lc3_audio_enabled",
+      enabled: enabled,
+    })
+  }
   // Buffer recording commands
   async sendStartBufferRecording() {
     return await this.sendData({

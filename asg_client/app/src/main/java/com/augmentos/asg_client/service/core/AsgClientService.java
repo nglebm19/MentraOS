@@ -30,6 +30,7 @@ import com.augmentos.asg_client.service.system.interfaces.IStateManager;
 import com.augmentos.asg_client.service.media.interfaces.IMediaManager;
 import com.augmentos.asg_client.service.system.managers.StateManager;
 import com.augmentos.augmentos_core.AugmentosService;
+import com.augmentos.asg_client.service.utils.ServiceUtils;
 
 import org.greenrobot.eventbus.EventBus;
 import org.greenrobot.eventbus.Subscribe;
@@ -65,6 +66,8 @@ public class AsgClientService extends Service implements NetworkStateListener, B
     public static final String ACTION_RESTART_SERVICE = "com.augmentos.asg_client.ACTION_RESTART_SERVICE";
     public static final String ACTION_RESTART_COMPLETE = "com.augmentos.asg_client.ACTION_RESTART_COMPLETE";
     public static final String ACTION_RESTART_CAMERA = "com.augmentos.asg_client.ACTION_RESTART_CAMERA";
+    public static final String ACTION_I2S_AUDIO_STATE = "com.augmentos.asg_client.ACTION_I2S_AUDIO_STATE";
+    public static final String EXTRA_I2S_AUDIO_PLAYING = "extra_i2s_audio_playing";
     public static final String ACTION_START_OTA_UPDATER = "ACTION_START_OTA_UPDATER";
 
     // OTA Update progress actions
@@ -75,6 +78,7 @@ public class AsgClientService extends Service implements NetworkStateListener, B
     // Service health monitoring
     private static final String ACTION_HEARTBEAT = "com.augmentos.asg_client.ACTION_HEARTBEAT";
     private static final String ACTION_HEARTBEAT_ACK = "com.augmentos.asg_client.ACTION_HEARTBEAT_ACK";
+    private static final long HEARTBEAT_TIMEOUT_MS = 35000; // 35 seconds timeout
 
     // ---------------------------------------------
     // Dependency Injection Container
@@ -95,6 +99,9 @@ public class AsgClientService extends Service implements NetworkStateListener, B
     // ---------------------------------------------
     private AugmentosService augmentosService = null;
     private boolean isAugmentosBound = false;
+    private static AsgClientService instance;
+    private boolean lastI2sPlaying = false;
+    private boolean isConnected = false; // Track connection state based on heartbeat
 
     // ---------------------------------------------
     // WiFi State Management
@@ -111,6 +118,12 @@ public class AsgClientService extends Service implements NetworkStateListener, B
     private BroadcastReceiver heartbeatReceiver;
     private BroadcastReceiver restartReceiver;
     private BroadcastReceiver otaProgressReceiver;
+    
+    // ---------------------------------------------
+    // Heartbeat Timeout Management
+    // ---------------------------------------------
+    private Handler heartbeatTimeoutHandler;
+    private Runnable heartbeatTimeoutRunnable;
 
     // ---------------------------------------------
     // ServiceConnection for AugmentosService
@@ -170,6 +183,8 @@ public class AsgClientService extends Service implements NetworkStateListener, B
         Log.i(TAG, "🚀 AsgClientServiceV2 onCreate() started");
         Log.d(TAG, "📊 Android API Level: " + Build.VERSION.SDK_INT);
 
+        instance = this;
+
         try {
             // Register for EventBus events
             Log.d(TAG, "📡 Registering for EventBus events");
@@ -191,6 +206,14 @@ public class AsgClientService extends Service implements NetworkStateListener, B
             // Send version info
             Log.d(TAG, "📋 Sending initial version information");
             sendVersionInfo();
+
+            // Start heartbeat monitoring
+            Log.d(TAG, "💓 Starting heartbeat monitoring");
+            startHeartbeatMonitoring();
+
+            // Clean up orphaned BLE transfer files from previous sessions
+            Log.d(TAG, "🗑️ Cleaning up orphaned BLE transfer files");
+            cleanupOrphanedBleTransfers();
 
             Log.i(TAG, "✅ AsgClientServiceV2 onCreate() completed successfully");
         } catch (Exception e) {
@@ -223,7 +246,13 @@ public class AsgClientService extends Service implements NetworkStateListener, B
 
             String action = intent.getAction();
             Log.i(TAG, "🎯 Processing action: " + action);
-            
+
+            if (ACTION_I2S_AUDIO_STATE.equals(action)) {
+                boolean playing = intent.getBooleanExtra(EXTRA_I2S_AUDIO_PLAYING, false);
+                handleI2SAudioState(playing);
+                return START_STICKY;
+            }
+
             // Delegate action handling to lifecycle manager
             lifecycleManager.handleAction(action, intent.getExtras());
             Log.d(TAG, "✅ Action processed successfully");
@@ -288,7 +317,8 @@ public class AsgClientService extends Service implements NetworkStateListener, B
         } catch (Exception e) {
             Log.e(TAG, "💥 Error in onDestroy()", e);
         }
-        
+
+        instance = null;
         super.onDestroy();
     }
 
@@ -296,6 +326,108 @@ public class AsgClientService extends Service implements NetworkStateListener, B
     public IBinder onBind(Intent intent) {
         Log.d(TAG, "🔗 onBind() called");
         return new LocalBinder();
+    }
+
+    public static AsgClientService getInstance() {
+        return instance;
+    }
+
+    public void handleI2SAudioState(boolean playing) {
+        Log.i(TAG, "I2S audio state request: " + (playing ? "start" : "stop"));
+
+        if (playing == lastI2sPlaying) {
+            Log.d(TAG, "I2S state unchanged, skipping command");
+            return;
+        }
+
+        final String command = playing ? "mh_starti2s" : "mh_stopi2s";
+
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("C", command);
+            payload.put("B", new JSONObject());
+
+            boolean sent = sendK900Command(command);
+            //boolean sent = sendK900Command(payload.toString());
+            if (sent) {
+                lastI2sPlaying = playing;
+            }
+        } catch (JSONException e) {
+            Log.e(TAG, "Failed to construct I2S command payload", e);
+        }
+    }
+
+    // ---------------------------------------------
+    // Touch/Swipe Event Commands
+    // ---------------------------------------------
+    
+    /**
+     * Enable or disable touch event reporting
+     * @param enable true to enable touch events, false to disable
+     */
+    public void handleTouchEventControl(boolean enable) {
+        Log.i(TAG, "Touch event control request: " + (enable ? "enable" : "disable"));
+
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("C", "cs_swst");
+            JSONObject bData = new JSONObject();
+            bData.put("type", 26);
+            bData.put("switch", enable);
+            payload.put("B", bData);
+
+            boolean sent = sendK900Command(payload.toString());
+            if (sent) {
+                Log.i(TAG, "Touch event control command sent successfully");
+            }
+        } catch (JSONException e) {
+            Log.e(TAG, "Failed to construct touch event control payload", e);
+        }
+    }
+
+    /**
+     * Enable or disable swipe volume control
+     * @param enable true to enable swipe volume control, false to disable
+     */
+    public void handleSwipeVolumeControl(boolean enable) {
+        Log.i(TAG, "Swipe volume control request: " + (enable ? "enable" : "disable"));
+
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("C", "cs_fbvol");
+            JSONObject bData = new JSONObject();
+            bData.put("switch", enable);
+            payload.put("B", bData);
+
+            boolean sent = sendK900Command(payload.toString());
+            if (sent) {
+                Log.i(TAG, "Swipe volume control command sent successfully");
+            }
+        } catch (JSONException e) {
+            Log.e(TAG, "Failed to construct swipe volume control payload", e);
+        }
+    }
+
+    private boolean sendK900Command(String payload) {
+        if (serviceContainer == null || serviceContainer.getServiceManager() == null) {
+            Log.w(TAG, "ServiceContainer not initialized; cannot send I2S command");
+            return false;
+        }
+
+        var bluetoothManager = serviceContainer.getServiceManager().getBluetoothManager();
+        if (bluetoothManager == null) {
+            Log.w(TAG, "Bluetooth manager unavailable; cannot send I2S command");
+            return false;
+        }
+
+        if (!bluetoothManager.isConnected()) {
+            Log.w(TAG, "Bluetooth manager not connected; cannot send I2S command");
+            return false;
+        }
+
+        boolean sent = bluetoothManager.sendData(payload.getBytes(StandardCharsets.UTF_8));
+        Log.i(TAG, "I2S command sent (" + payload + ") result=" + sent);
+        return sent;
     }
 
     // ---------------------------------------------
@@ -415,6 +547,9 @@ public class AsgClientService extends Service implements NetworkStateListener, B
             } else {
                 Log.d(TAG, "⏭️ OTA progress receiver is null - skipping");
             }
+            
+            // Stop heartbeat monitoring
+            stopHeartbeatMonitoring();
             
             Log.d(TAG, "✅ All receivers unregistered successfully");
         } catch (IllegalArgumentException e) {
@@ -600,11 +735,11 @@ public class AsgClientService extends Service implements NetworkStateListener, B
             
             versionInfo.put("app_version", appVersion);
             versionInfo.put("build_number", buildNumber);
-            versionInfo.put("device_model", android.os.Build.MODEL);
+            versionInfo.put("device_model", ServiceUtils.getDeviceTypeString(this));
             versionInfo.put("android_version", android.os.Build.VERSION.RELEASE);
             versionInfo.put("ota_version_url", OtaConstants.VERSION_JSON_URL);
 
-            Log.d(TAG, "📋 Version info prepared - Device: " + android.os.Build.MODEL + 
+            Log.d(TAG, "📋 Version info prepared - Device: " + ServiceUtils.getDeviceTypeString(this) + 
                       ", Android: " + android.os.Build.VERSION.RELEASE + 
                       ", OTA URL: " + OtaConstants.VERSION_JSON_URL);
 
@@ -789,6 +924,95 @@ public class AsgClientService extends Service implements NetworkStateListener, B
         }
     }
 
+    /**
+     * Reset heartbeat timeout - called when heartbeat is received
+     */
+    private void resetHeartbeatTimeout() {
+        Log.d(TAG, "💓 Resetting heartbeat timeout");
+        
+        try {
+            // Cancel any existing timeout
+            heartbeatTimeoutHandler.removeCallbacks(heartbeatTimeoutRunnable);
+            
+            // Mark as connected
+            isConnected = true;
+            Log.d(TAG, "🔌 Connection state changed to CONNECTED");
+            
+            // Schedule new timeout
+            heartbeatTimeoutHandler.postDelayed(heartbeatTimeoutRunnable, HEARTBEAT_TIMEOUT_MS);
+            Log.d(TAG, "⏰ Heartbeat timeout scheduled for " + HEARTBEAT_TIMEOUT_MS + "ms");
+            
+        } catch (Exception e) {
+            Log.e(TAG, "💥 Error resetting heartbeat timeout", e);
+        }
+    }
+
+    /**
+     * Start heartbeat monitoring - call this when service becomes active
+     */
+    public void startHeartbeatMonitoring() {
+        Log.d(TAG, "💓 Starting heartbeat monitoring");
+        
+        try {
+            // Initialize heartbeat timeout handler if not already done
+            if (heartbeatTimeoutHandler == null) {
+                Log.d(TAG, "💓 Initializing heartbeat timeout handler");
+                heartbeatTimeoutHandler = new Handler(Looper.getMainLooper());
+                heartbeatTimeoutRunnable = () -> {
+                    Log.w(TAG, "⚠️ Heartbeat timeout - marking as disconnected");
+                    isConnected = false;
+                    Log.i(TAG, "🔌 Connection state changed to DISCONNECTED due to heartbeat timeout");
+                };
+            }
+            
+            // Cancel any existing timeout
+            heartbeatTimeoutHandler.removeCallbacks(heartbeatTimeoutRunnable);
+            
+            // Don't set connected state - wait for first heartbeat
+            isConnected = false;
+            Log.d(TAG, "🔌 Connection state initialized as DISCONNECTED - waiting for first heartbeat");
+            
+            // Schedule initial timeout to detect if no heartbeat comes
+            heartbeatTimeoutHandler.postDelayed(heartbeatTimeoutRunnable, HEARTBEAT_TIMEOUT_MS);
+            Log.d(TAG, "⏰ Initial heartbeat timeout scheduled for " + HEARTBEAT_TIMEOUT_MS + "ms");
+            
+        } catch (Exception e) {
+            Log.e(TAG, "💥 Error starting heartbeat monitoring", e);
+        }
+    }
+
+    /**
+     * Stop heartbeat monitoring - call this when service becomes inactive
+     */
+    public void stopHeartbeatMonitoring() {
+        Log.d(TAG, "💓 Stopping heartbeat monitoring");
+        
+        try {
+            heartbeatTimeoutHandler.removeCallbacks(heartbeatTimeoutRunnable);
+            isConnected = false;
+            Log.d(TAG, "🔌 Connection state changed to DISCONNECTED (monitoring stopped)");
+        } catch (Exception e) {
+            Log.e(TAG, "💥 Error stopping heartbeat monitoring", e);
+        }
+    }
+
+    /**
+     * Get current connection state
+     */
+    public boolean isConnected() {
+        return isConnected;
+    }
+
+    /**
+     * Handle service heartbeat received from MentraLiveSGC
+     */
+    public void onServiceHeartbeatReceived() {
+        Log.d(TAG, "💓 Service heartbeat received from MentraLiveSGC");
+        
+        // Reset heartbeat timeout and mark as connected
+        resetHeartbeatTimeout();
+    }
+
     private void registerRestartReceiver() {
         Log.d(TAG, "🔄 registerRestartReceiver() started");
         
@@ -942,7 +1166,7 @@ public class AsgClientService extends Service implements NetworkStateListener, B
     // ---------------------------------------------
     public static void openWifi(Context context, boolean bEnable) {
         Log.d(TAG, "🌐 openWifi() called - Enable: " + bEnable);
-        
+
         try {
             if (bEnable) {
                 Log.d(TAG, "📶 Enabling WiFi via ADB command");
@@ -955,6 +1179,78 @@ public class AsgClientService extends Service implements NetworkStateListener, B
             }
         } catch (Exception e) {
             Log.e(TAG, "💥 Error executing WiFi command", e);
+        }
+    }
+
+    /**
+     * Clean up orphaned BLE transfer files from previous sessions.
+     * These are compressed AVIF files stored in the app's external files directory
+     * that were never successfully transferred and deleted.
+     * This runs on boot, so any BLE temp files are by definition orphaned.
+     */
+    private void cleanupOrphanedBleTransfers() {
+        try {
+            // App's external files directory where compressed files are stored
+            java.io.File appFilesDir = getExternalFilesDir("");
+            if (appFilesDir == null || !appFilesDir.exists()) {
+                Log.d(TAG, "🗑️ App files directory does not exist, skipping cleanup");
+                return;
+            }
+
+            Log.d(TAG, "🗑️ Checking for orphaned BLE transfer files in: " + appFilesDir.getAbsolutePath());
+
+            // Look for package directories
+            java.io.File[] packageDirs = appFilesDir.listFiles(java.io.File::isDirectory);
+            if (packageDirs == null) {
+                Log.d(TAG, "🗑️ No package directories found");
+                return;
+            }
+
+            int totalCleaned = 0;
+            long totalSpaceFreed = 0;
+
+            for (java.io.File packageDir : packageDirs) {
+                // Look for BLE image files (no extension, just bleImgId pattern)
+                java.io.File[] files = packageDir.listFiles((dir, name) ->
+                    // BLE images have pattern like "ble_1234567890" (no extension)
+                    name.startsWith("ble_") && !name.contains(".")
+                );
+
+                if (files != null && files.length > 0) {
+                    Log.d(TAG, "🗑️ Found " + files.length + " orphaned BLE files in " + packageDir.getName());
+
+                    // On boot, ALL BLE temp files are orphaned - no need for time check
+                    for (java.io.File file : files) {
+                        long fileSize = file.length();
+                        String fileName = file.getName();
+                        long ageMinutes = (System.currentTimeMillis() - file.lastModified()) / 1000 / 60;
+
+                        if (file.delete()) {
+                            totalCleaned++;
+                            totalSpaceFreed += fileSize;
+                            Log.d(TAG, "🗑️ Deleted orphaned BLE transfer: " + fileName +
+                                      " (age: " + ageMinutes + " minutes, size: " + (fileSize / 1024) + " KB)");
+                        } else {
+                            Log.w(TAG, "🗑️ Failed to delete orphaned file: " + fileName);
+                        }
+                    }
+                }
+            }
+
+            if (totalCleaned > 0) {
+                Log.i(TAG, "🗑️ Cleanup complete: Deleted " + totalCleaned + " orphaned BLE files, freed " +
+                          (totalSpaceFreed / 1024) + " KB");
+                // Optional: Show notification about cleanup
+//                if (serviceContainer != null && serviceContainer.getNotificationManager() != null) {
+//                    serviceContainer.getNotificationManager().showDebugNotification("BLE Cleanup",
+//                        "Cleaned " + totalCleaned + " orphaned transfers (" + (totalSpaceFreed / 1024) + " KB)");
+//                }
+            } else {
+                Log.d(TAG, "🗑️ No orphaned BLE transfer files found");
+            }
+
+        } catch (Exception e) {
+            Log.e(TAG, "🗑️ Error cleaning up orphaned BLE transfers", e);
         }
     }
 } 

@@ -20,7 +20,6 @@ import {
   StreamInstance,
   ProviderType,
   StreamState,
-  TranscriptionError,
   InvalidSubscriptionError,
   NoProviderAvailableError,
   ResourceLimitError,
@@ -51,7 +50,7 @@ export class TranscriptionManager {
 
   // Retry Logic
   private streamRetryAttempts = new Map<string, number>();
-  private streamCreationInProgress = new Set<string>();
+  private streamCreationPromises = new Map<string, Promise<void>>();
 
   // VAD Audio Buffering (to prevent missing speech during stream startup)
   private vadAudioBuffer: ArrayBuffer[] = [];
@@ -95,6 +94,17 @@ export class TranscriptionManager {
       },
       "TranscriptionManager created - initializing providers...",
     );
+  }
+
+  // Local helper to normalize Node Buffer to ArrayBuffer
+  private toArrayBuffer(input: ArrayBuffer | Buffer): ArrayBuffer {
+    if (typeof Buffer !== "undefined" && Buffer.isBuffer(input)) {
+      const buf = input as unknown as Buffer;
+      const ab = new ArrayBuffer(buf.length);
+      new Uint8Array(ab).set(buf);
+      return ab;
+    }
+    return input as ArrayBuffer;
   }
 
   async handleLocalTranscription(message: LocalTranscription): Promise<void> {
@@ -282,7 +292,7 @@ export class TranscriptionManager {
 
     // Step 1: Clean up streams that no longer have subscriptions
     const streamsToCleanup: string[] = [];
-    for (const [subscription, stream] of this.streams.entries()) {
+    for (const [subscription, _stream] of this.streams.entries()) {
       if (!this.activeSubscriptions.has(subscription)) {
         streamsToCleanup.push(subscription);
       }
@@ -354,7 +364,7 @@ export class TranscriptionManager {
     let successCount = 0;
     let failureCount = 0;
 
-    results.forEach((result, index) => {
+    results.forEach((result, _index) => {
       if (result.status === "rejected") {
         failureCount++;
         this.logger.error(
@@ -590,12 +600,14 @@ export class TranscriptionManager {
       "TranscriptionManager is initialized, proceeding with stream start",
     );
 
-    // Prevent duplicate creation
-    if (this.streamCreationInProgress.has(subscription)) {
+    // Check if there's already a creation in progress - if so, wait for it
+    const existingCreation = this.streamCreationPromises.get(subscription);
+    if (existingCreation) {
       this.logger.debug(
         { subscription },
-        "Stream creation already in progress",
+        "Stream creation already in progress, waiting for existing creation",
       );
+      await existingCreation;
       return;
     }
 
@@ -611,8 +623,27 @@ export class TranscriptionManager {
       await this.cleanupStream(subscription, "replacing_stream");
     }
 
-    this.streamCreationInProgress.add(subscription);
+    // Create the actual creation promise and store it
+    const creationPromise = this._performStreamCreation(
+      subscription,
+      timeoutMs,
+    );
+    this.streamCreationPromises.set(subscription, creationPromise);
 
+    try {
+      await creationPromise;
+    } finally {
+      this.streamCreationPromises.delete(subscription);
+    }
+  }
+
+  /**
+   * Internal method to perform actual stream creation
+   */
+  private async _performStreamCreation(
+    subscription: ExtendedStreamType,
+    timeoutMs: number,
+  ): Promise<void> {
     try {
       // Provider selector should be initialized now
       if (!this.providerSelector) {
@@ -666,18 +697,16 @@ export class TranscriptionManager {
         "Failed to start stream with custom timeout",
       );
       throw error;
-    } finally {
-      this.streamCreationInProgress.delete(subscription);
     }
   }
 
   /**
    * Feed audio to all active streams
    */
-  feedAudio(audioData: ArrayBuffer): void {
+  feedAudio(audioData: ArrayBuffer | Buffer): void {
     // If we're buffering for VAD, add to buffer
     if (this.isBufferingForVAD) {
-      this.vadAudioBuffer.push(audioData);
+      this.vadAudioBuffer.push(this.toArrayBuffer(audioData));
 
       // Prevent buffer from growing too large
       if (this.vadAudioBuffer.length > this.vadBufferMaxSize) {
@@ -701,15 +730,16 @@ export class TranscriptionManager {
   /**
    * Internal method to feed audio directly to streams
    */
-  private feedAudioToStreams(audioData: ArrayBuffer): void {
+  private feedAudioToStreams(audioData: ArrayBuffer | Buffer): void {
     // Don't feed audio if not initialized - just silently drop it
     if (!this.isInitialized || this.streams.size === 0) {
       return;
     }
 
+    const normalized = this.toArrayBuffer(audioData);
     for (const [subscription, stream] of this.streams) {
       try {
-        stream.writeAudio(audioData);
+        stream.writeAudio(normalized);
       } catch (error) {
         this.logger.warn(
           {
@@ -937,7 +967,9 @@ export class TranscriptionManager {
 
       // Check if we have at least one provider
       if (this.providers.size === 0) {
-        const errorMsg = `No transcription providers available. Errors: ${providerErrors.map((e) => `${e.provider}: ${e.error.message}`).join(", ")}`;
+        const errorMsg = `No transcription providers available. Errors: ${providerErrors
+          .map((e) => `${e.provider}: ${e.error.message}`)
+          .join(", ")}`;
         this.logger.error(
           {
             providerErrors,
@@ -999,12 +1031,14 @@ export class TranscriptionManager {
     // Ensure we're initialized before starting streams
     await this.ensureInitialized();
 
-    // Prevent duplicate creation
-    if (this.streamCreationInProgress.has(subscription)) {
+    // Check if there's already a creation in progress - if so, wait for it
+    const existingCreation = this.streamCreationPromises.get(subscription);
+    if (existingCreation) {
       this.logger.debug(
         { subscription },
-        "Stream creation already in progress",
+        "Stream creation already in progress, waiting for existing creation",
       );
+      await existingCreation;
       return;
     }
 
@@ -1020,8 +1054,24 @@ export class TranscriptionManager {
       await this.cleanupStream(subscription, "replacing_stream");
     }
 
-    this.streamCreationInProgress.add(subscription);
+    // Create the actual creation promise and store it
+    const creationPromise =
+      this._performStreamCreationForStartStream(subscription);
+    this.streamCreationPromises.set(subscription, creationPromise);
 
+    try {
+      await creationPromise;
+    } finally {
+      this.streamCreationPromises.delete(subscription);
+    }
+  }
+
+  /**
+   * Internal method to perform actual stream creation for startStream
+   */
+  private async _performStreamCreationForStartStream(
+    subscription: ExtendedStreamType,
+  ): Promise<void> {
     try {
       // Provider selector should be initialized now
       if (!this.providerSelector) {
@@ -1066,7 +1116,9 @@ export class TranscriptionManager {
           streamId: stream.id,
           initTime: stream.metrics.initializationTime,
         },
-        `🚀 STREAM CREATED: [${provider.name.toUpperCase()}] for "${subscription}" (${stream.metrics.initializationTime}ms)`,
+        `🚀 STREAM CREATED: [${provider.name.toUpperCase()}] for "${subscription}" (${
+          stream.metrics.initializationTime
+        }ms)`,
       );
 
       // Track success
@@ -1083,8 +1135,7 @@ export class TranscriptionManager {
       const logger = this.logger.child({ subscription });
       logger.error(error, "Stream creation failed");
       await this.handleStreamError(subscription, null, error as Error);
-    } finally {
-      this.streamCreationInProgress.delete(subscription);
+      throw error;
     }
   }
 
@@ -1731,7 +1782,9 @@ export class TranscriptionManager {
   }
 
   private generateStreamId(subscription: ExtendedStreamType): string {
-    return `${this.userSession.sessionId}-${subscription}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    return `${
+      this.userSession.sessionId
+    }-${subscription}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   }
 
   /**
@@ -1857,14 +1910,18 @@ export class TranscriptionManager {
           provider: data.provider || "unknown",
           dataType: data.type,
           text: data.text
-            ? `"${data.text.substring(0, 100)}${data.text.length > 100 ? "..." : ""}"`
+            ? `"${data.text.substring(0, 100)}${
+                data.text.length > 100 ? "..." : ""
+              }"`
             : "no text",
           isFinal: data.isFinal,
           confidence: data.confidence,
           appsNotified: subscribedApps.length,
           subscribedApps,
         },
-        `📝 TRANSCRIPTION: [${data.provider || "unknown"}] ${data.isFinal ? "FINAL" : "interim"} "${data.text || "no text"}" → ${subscribedApps.length} apps`,
+        `📝 TRANSCRIPTION: [${data.provider || "unknown"}] ${
+          data.isFinal ? "FINAL" : "interim"
+        } "${data.text || "no text"}" → ${subscribedApps.length} apps`,
       );
     } catch (error) {
       this.logger.error(
@@ -2192,7 +2249,7 @@ export class TranscriptionManager {
       this.streams.clear();
       this.activeSubscriptions.clear();
       this.streamRetryAttempts.clear();
-      this.streamCreationInProgress.clear();
+      this.streamCreationPromises.clear();
 
       // Clear pending operations
       this.pendingOperations = [];

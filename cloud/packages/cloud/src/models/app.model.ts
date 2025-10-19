@@ -4,12 +4,12 @@ import {
   AppI as _AppI,
   AppType,
   ToolSchema,
-  ToolParameterSchema,
+  // ToolParameterSchema,
   AppSetting,
   AppSettingType,
   PermissionType,
   Permission,
-  HardwareRequirement,
+  // HardwareRequirement,
   HardwareType,
   HardwareRequirementLevel,
 } from "@mentra/sdk";
@@ -92,6 +92,7 @@ const AppSchema = new Schema(
       enum: ["DEVELOPMENT", "SUBMITTED", "REJECTED", "PUBLISHED"],
       default: "DEVELOPMENT",
     },
+    hashedApiKey: String,
     reviewNotes: {
       type: String,
       default: "",
